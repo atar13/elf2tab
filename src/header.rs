@@ -20,6 +20,7 @@ pub enum TbfHeaderTypes {
     KernelVersion = 8,
     Program = 9,
     ShortId = 10,
+    SharedLibrary = 11,
 
     Credentials = 128,
 }
@@ -129,6 +130,13 @@ struct TbfHeaderKernelVersion {
 struct TbfHeaderShortId {
     base: TbfHeaderTlv,
     short_id: u32,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Debug)]
+struct TbfHeaderSharedLibrary {
+    base: TbfHeaderTlv,
+    is_shared_library: u32,
 }
 
 #[repr(C)]
@@ -294,6 +302,18 @@ impl fmt::Display for TbfHeaderShortId {
     }
 }
 
+impl fmt::Display for TbfHeaderSharedLibrary {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        // ^x.y means >= x.y, < (x+1).0
+        writeln!(
+            f,
+            "
+               is_shared_library: {0:>#10X}",
+            self.is_shared_library
+        )
+    }
+}
+
 const FLAGS_ENABLE: u32 = 0x0000_0001;
 
 pub struct TbfHeader {
@@ -307,8 +327,11 @@ pub struct TbfHeader {
     hdr_persistent: Option<TbfHeaderPersistentAcl>,
     hdr_kernel_version: Option<TbfHeaderKernelVersion>,
     hdr_short_id: Option<TbfHeaderShortId>,
+    hdr_shared_library: Option<TbfHeaderSharedLibrary>,
+    shlib_deps: Vec<String>,
     package_name: String,
     package_name_pad: usize,
+    shlib_dep_names_pad: usize,
 }
 
 impl TbfHeader {
@@ -339,8 +362,11 @@ impl TbfHeader {
             hdr_persistent: None,
             hdr_kernel_version: None,
             hdr_short_id: None,
+            hdr_shared_library: None,
             package_name: String::new(),
+            shlib_deps: Vec::new(),
             package_name_pad: 0,
+            shlib_dep_names_pad: 0,
         }
     }
 
@@ -362,6 +388,8 @@ impl TbfHeader {
         storage_ids: (Option<u32>, Option<Vec<u32>>, Option<Vec<u32>>),
         kernel_version: Option<(u16, u16)>,
         short_id: Option<u32>,
+        shared_library: Option<u32>,
+        shared_library_deps: Vec<String>,
         disabled: bool,
     ) -> usize {
         // Need to calculate lengths ahead of time. Need the base and the
@@ -461,6 +489,25 @@ impl TbfHeader {
         if short_id.is_some() {
             header_length += mem::size_of::<TbfHeaderShortId>();
         }
+
+        // Check if we have to include shared library information
+        let shlib_dep_names_size = if shared_library.is_some() {
+            header_length += mem::size_of::<TbfHeaderSharedLibrary>();
+
+            let shlib_dep_names_size = shared_library_deps.iter().fold(0, |acc, x| {
+                acc + x.len() + 1 // extra byte for null terminator between every dep 
+            });
+            header_length += shlib_dep_names_size;
+            
+            // How much padding is needed to ensure we are aligned to 4?
+            self.shlib_dep_names_pad = amount_alignment_needed(header_length as u32, 4) as usize;
+            // Header length increases by that padding
+            header_length += self.shlib_dep_names_pad;
+
+            shlib_dep_names_size
+        } else {
+            0
+        };
 
         let mut flags = 0x0000_0000;
 
@@ -570,6 +617,20 @@ impl TbfHeader {
                 },
                 short_id: short_id_num,
             });
+        }
+
+        if let Some(is_shared_library) = shared_library {
+            // Size of field that says whether or not this 
+            // package is a shared library or not. Represented
+            // as a 1 or 0 with padding to 4 bytes.
+            self.hdr_shared_library = Some(TbfHeaderSharedLibrary {
+                base: TbfHeaderTlv {
+                    tipe: TbfHeaderTypes::SharedLibrary,
+                    length: mem::size_of::<u32>() as u16 + shlib_dep_names_size as u16 ,
+                },
+                is_shared_library,
+            });
+            self.shlib_deps = shared_library_deps;
         }
 
         // Return the length by generating the header and seeing how long it is.
@@ -721,13 +782,22 @@ impl TbfHeader {
             header_buf.write_all(unsafe { util::as_byte_slice(&self.hdr_short_id) })?;
         }
 
+        if self.hdr_shared_library.is_some() {
+            header_buf.write_all(unsafe { util::as_byte_slice(&self.hdr_shared_library) })?;
+            for dep in &self.shlib_deps {
+                header_buf.write_all(dep.as_ref())?;
+                header_buf.write_all(b"\0")?;
+            }
+            util::do_pad(&mut header_buf, self.shlib_dep_names_pad)?;
+        }
+
         let current_length = header_buf.get_ref().len();
         util::do_pad(
             &mut header_buf,
             amount_alignment_needed(current_length as u32, 4) as usize,
         )?;
 
-        self.inject_checksum(header_buf)
+        self.inject_checksum(header_buf.clone())
     }
 
     /// Take a TBF header and calculate the checksum. Then insert that checksum
@@ -790,6 +860,8 @@ impl fmt::Display for TbfHeader {
         self.hdr_kernel_version
             .map_or(Ok(()), |hdr| write!(f, "{}", hdr))?;
         self.hdr_short_id
+            .map_or(Ok(()), |hdr| write!(f, "{}", hdr))?;
+        self.hdr_shared_library
             .map_or(Ok(()), |hdr| write!(f, "{}", hdr))?;
         Ok(())
     }

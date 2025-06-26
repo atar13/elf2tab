@@ -222,6 +222,14 @@ pub struct Opt {
         help = "Add an 4096-bit RSA signature credential using this private key"
     )]
     pub rsa4096_private_key: Option<PathBuf>,
+
+    #[arg(
+        long = "shared_library_deps",
+        id = "shlib_deps",
+        help = "Filepaths to shared libraries ELF (.so) files that this app depends on",
+        num_args = 1..,
+    )]
+    pub shlib_deps: Option<Vec<PathBuf>>,
 }
 
 mod test {

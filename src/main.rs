@@ -99,6 +99,7 @@ fn main() {
         };
         // Use the architecture to name the TBF in the TAB.
         let tab_tbf_name = format!("{}.tbf", architecture);
+        let fn_reloc_name = format!("{}-reloc.toml", architecture);
 
         if opt.output.clone() == tbf_path.clone() {
             panic!(
@@ -118,6 +119,14 @@ fn main() {
             .open(tbf_path.clone())
             .unwrap();
 
+        let mut relocation_outfile: fs::File = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(fn_reloc_name.clone())
+            .unwrap();
+
         // Do the conversion to a tock binary.
         if opt.verbose {
             println!("Creating {:?}", tbf_path);
@@ -126,6 +135,7 @@ fn main() {
         // for generating credentials; once it's written to the vector, flush
         // it to a file.
         let mut output_vector = Vec::<u8>::new();
+        let mut output_relocation = String::new();
         convert::elf_to_tbf(
             &mut fsfile,
             &mut output_vector,
@@ -146,6 +156,8 @@ fn main() {
             opt.sha384_enable,
             opt.sha512_enable,
             opt.rsa4096_private_key.clone(),
+            opt.shlib_deps.clone(),
+            &mut output_relocation,
         )
         .unwrap();
         if opt.verbose {
@@ -163,5 +175,17 @@ fn main() {
         // Add the file to the TAB tar file.
         outfile.seek(io::SeekFrom::Start(0)).unwrap();
         tab.append_file(tab_tbf_name, &mut outfile).unwrap();
+
+        match relocation_outfile.write_all(output_relocation.as_bytes()) {
+            Err(e) => {
+                println!("Failed to write relocation toml file: {:?}", e);
+                return;
+            }
+            _ => {}
+        }
+
+        // Add relocation TOML to TAB tar file
+        relocation_outfile.seek(io::SeekFrom::Start(0)).unwrap();
+        tab.append_file(fn_reloc_name, &mut relocation_outfile).unwrap();
     }
 }

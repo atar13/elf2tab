@@ -2,14 +2,18 @@
 
 use crate::header;
 use crate::util::{self, align_to, amount_alignment_needed};
+use elf::abi::{DT_NEEDED, DT_STRTAB, STB_GLOBAL, STT_FUNC};
+use elf::to_str::{e_type_to_human_str, e_type_to_string};
 use ring::signature::KeyPair;
 use ring::{rand, signature};
 use sha2::{Digest, Sha256, Sha384, Sha512};
 use std::cmp;
+use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::mem;
 use std::path::{Path, PathBuf};
 use std::{fs, io};
+use std::fmt::Write as fmtwrite;
 
 /// Helper function for reading RSA DER key files.
 fn read_rsa_file(path: &std::path::Path) -> Result<Vec<u8>, std::io::Error> {
@@ -110,6 +114,333 @@ fn section_in_segment(
         && secoffset - poffset <= segment.p_filesz - 1
 }
 
+#[derive(Debug)]
+pub struct AppFuncReloc {
+    /// Name of function to relocate
+    fn_name: String,
+    /// Address of GOT entry for function
+    /// within the app's flash 
+    app_got_addr: u32,
+}
+
+/// Shared library relocation information
+struct ShLibFnReloc {
+    /// Name of library which contains the 
+    /// function code.
+    /// To be populated when elf2tab searches through
+    /// function symbols in libraries passed in and finds
+    /// which one has the needed function symbol.
+    lib_name: String,
+    /// Offset of function in shared library flash
+    lib_fn_offset: u32,
+}
+
+/// Helper function to get the names of any shared library 
+/// dependencies that this ELF depends on.
+///
+/// The library names include their file extension (such as .so).
+fn get_shared_library_deps(elf_file: &elf::ElfBytes::<elf::endian::AnyEndian>, elf_file_buf: &[u8]) -> Result<Vec<String>, ()> {
+    // Loop through structures in .dynamic section
+    if let Ok(Some(parsing_table)) = elf_file.dynamic() {
+        let mut shlib_strtab_idxs= Vec::new();
+        let mut strtab_addr = None;
+        for dynamic_structure in parsing_table.iter() {
+            match dynamic_structure.d_tag {
+                DT_NEEDED => {
+                    // From page 80 of https://refspecs.linuxfoundation.org/elf/elf.pdf
+                    // This element holds the string table offset of a null-terminated string, giving
+                    // the name of a needed library. The offset is an index into the table recorded
+                    // in the DT_STRTAB entry. See "Shared Object Dependencies'' for more
+                    // information about these names. The dynamic array may contain multiple
+                    // entries with this type. These entries' relative order is significant, though
+                    // their relation to entries of other types is not.
+                    shlib_strtab_idxs.push(dynamic_structure.d_val() as usize);
+                },
+                DT_STRTAB => {
+                    // Gets the address of our strtab (string table) 
+                    // See Chapter 1 of https://refspecs.linuxfoundation.org/elf/elf.pdf
+                    //
+                    // However, this address is in flash and is of the format 0x8_______.
+                    // So, to use this address to index into the ELF file, we AND it with 0x0FFFFFFF.
+                    // The OR with 0x1000 is because for some reason the strtab started at
+                    // an offset of 0x1000 away from the given address.
+                    let fixed_strtab_addr = (dynamic_structure.d_ptr() & 0x0FFFFFFF) | 0x1000;
+                    strtab_addr = Some(fixed_strtab_addr as usize);
+                }
+                _ => () 
+            }
+        };
+        strtab_addr.map_or(Err(()), |strtab_addr| {
+            let b = &elf_file_buf.iter().as_slice()[strtab_addr..];
+            let new_strtab = elf::string_table::StringTable::new(b);
+            let mut dep_names = Vec::new();
+            for idx in shlib_strtab_idxs {
+                let _ = new_strtab.get(idx).map(|dep_name| {
+                    dep_names.push(dep_name.to_string())
+                });
+            }
+            Ok(dep_names)
+        })
+    } else {
+        Err(())
+    }
+}
+
+/// Should output a list of each function that needs relocation and
+/// where the address needs to be fixed up.
+/// 
+/// Then, Tockloader can take this information and fixup the 
+/// app binary to have the correct address where the library
+/// function is in flash.
+fn get_fn_relocs(verbose: bool, elf_sections: &Vec<(String, elf::section::SectionHeader)>, app_elf_file: &elf::ElfBytes::<elf::endian::AnyEndian>, app_elf_file_buf: &[u8], got_start_address_in_tbf: usize) -> Result<Vec<AppFuncReloc>, ()> {
+    let fn_names = if let Ok(Some((dyn_symtab, dyn_sym_strtab))) = app_elf_file.dynamic_symbol_table() {
+        let mut fn_names = vec![];
+        for sym in dyn_symtab {
+            let sym_type = sym.st_symtype();
+            let bind_type = sym.st_bind();
+            if sym_type == STT_FUNC && bind_type == STB_GLOBAL {
+                let fn_name = dyn_sym_strtab.get(sym.st_name as usize).unwrap();
+                // println!("function name {} {} {}", fn_name, sym.st_value, sym.st_shndx);
+                fn_names.push(fn_name);
+            }
+        }
+        fn_names
+    } else {
+        vec![]
+    };
+    let rel_data = elf_sections
+        .iter()
+        .find(|(sh_name, _)| *sh_name == ".rel.text")
+        .map(|(_, shdr)| {
+            app_elf_file.section_data_as_rels(shdr)
+        });
+
+
+    let (symtab, strtab) = app_elf_file.symbol_table().unwrap().unwrap();
+
+    let mut relocs: Vec<AppFuncReloc> = vec![];
+    if let Some(Ok(rels)) = rel_data {
+        for rel in rels.into_iter() {
+            let symtab_entry = symtab.get(rel.r_sym as usize).unwrap();
+            let sym_name = strtab.get(symtab_entry.st_name as usize).unwrap();
+            for fn_name in &fn_names {
+                if *fn_name == sym_name {
+                    if verbose {
+                        println!("found matching symbol for function needed to be relocated: {}", sym_name);
+                        println!("\t{:08X}", rel.r_offset);
+                        println!("\t{} {}", symtab_entry.st_value, symtab_entry.st_shndx);
+                    }
+
+                    let (_, shdr) = elf_sections
+                        .iter()
+                        .find(|(sh_name, _)| *sh_name == ".text")
+                        .map(|(_, shdr)| {
+                            (app_elf_file.section_data(shdr).unwrap(), shdr)
+                        }).unwrap();
+
+                    if verbose {
+                        println!("shdr .text offset {:08X}, addr {:08X}", shdr.sh_offset, shdr.sh_addr);
+                    }
+
+                    let addr_in_file = ((rel.r_offset - shdr.sh_addr) + shdr.sh_offset) as usize;
+                    let got_offset = &app_elf_file_buf[addr_in_file..addr_in_file+4];
+                    let mut got_offset_bytes = [0; 4];
+                    got_offset_bytes.copy_from_slice(&got_offset[0..4]);
+                    let got_offset_addr = u32::from_le_bytes(got_offset_bytes);
+                    
+                    let got_shdr = elf_sections
+                        .iter()
+                        .find(|(sh_name, _)| *sh_name == ".got")
+                        .map(|(_, shdr)| {
+                            shdr
+                        }).unwrap();
+
+                    if verbose {
+                        println!("GOT is at {:08X} in ELF file", got_shdr.sh_offset);
+                        println!("GOT is at {:08X} in TBF file", got_start_address_in_tbf);
+                    }
+
+                    let fn_got_entry = got_start_address_in_tbf as u32 + got_offset_addr;
+                    if verbose {
+                        println!("{} entry in GOT is at {:08X} in file", fn_name, fn_got_entry);
+                    }
+                    relocs.push(AppFuncReloc{
+                        fn_name: (*fn_name).to_string(),
+                        app_got_addr: fn_got_entry
+                    });
+                }
+            }
+        };
+    };
+
+    Ok(relocs)
+
+    // DOESN'T WORK WITH FUNCTION POINTERS
+    // // Loop through structures in .dynamic section
+    // if let Ok(Some(parsing_table)) = app_elf_file.dynamic() {
+    //     let mut jmp_rel_addr = None;
+    //     let mut plt_rel_size = None;
+    //     let mut rel_entry_size = None;
+    //
+    //     for dynamic_structure in parsing_table.iter() {
+    //         match dynamic_structure.d_tag {
+    //             DT_JMPREL => {
+    //                 jmp_rel_addr = Some(((dynamic_structure.d_ptr() & 0x0FFFFFFF) | 0x1000) as usize);
+    //             },
+    //             DT_PLTRELSZ => {
+    //                 plt_rel_size = Some(dynamic_structure.d_val() as usize);
+    //             },
+    //             DT_PLTREL => {
+    //                 if dynamic_structure.d_val() != DT_REL as u64 {
+    //                     return Err(())
+    //                 }
+    //             },
+    //             DT_RELENT => {
+    //                 rel_entry_size = Some(dynamic_structure.d_val() as usize);
+    //             },
+    //             _ => () 
+    //         }
+    //     };
+    //     
+    //     // println!("Relocation info: DT_JMP_REL: {:X?}, DT_PLTRELSZ: {:?}, DT_RELENT: {:?}", jmp_rel_addr, plt_rel_size, rel_entry_size);
+    //
+    //     jmp_rel_addr.map_or(Err(()), |jmp_rel_addr| {
+    //         plt_rel_size.map_or(Err(()), |plt_rel_size| {
+    //             let mut fn_relocs: Vec<AppFuncReloc> = Vec::new();
+    //
+    //             let jmp_rel_end_addr = jmp_rel_addr + plt_rel_size;
+    //
+    //             // Parse relocation table entries (only those relating to jumps)
+    //             // See page 1-22 of https://refspecs.linuxfoundation.org/elf/elf.pdf
+    //             const R_OFFSET_LEN: usize = 4;
+    //             const R_INFO_LEN: usize = 4;
+    //             for addr in (jmp_rel_addr..jmp_rel_end_addr).step_by(R_OFFSET_LEN + R_INFO_LEN) {
+    //
+    //                 let r_offset_end = addr + R_OFFSET_LEN;
+    //
+    //                 let mut r_offset_le_bytes: [u8; R_OFFSET_LEN] = [0; R_OFFSET_LEN];
+    //                 r_offset_le_bytes.copy_from_slice(&app_elf_file_buf[addr..r_offset_end]);
+    //                 let r_offset = u32::from_le_bytes(r_offset_le_bytes);
+    //
+    //                 let mut r_info_le_bytes: [u8; R_INFO_LEN] = [0; R_INFO_LEN];
+    //                 r_info_le_bytes.copy_from_slice(&app_elf_file_buf[r_offset_end..(r_offset_end + R_INFO_LEN)]);
+    //                 let r_info = u32::from_le_bytes(r_info_le_bytes);
+    //
+    //                 // See page 1-22 of https://refspecs.linuxfoundation.org/elf/elf.pdf
+    //                 // #define ELF32_R_SYM(i) ((i)>>8)
+    //                 let r_symtab_idx = r_info >> 8;
+    //                 
+    //                 // println!("0x{:x}: r_offset {:x}, r_info {:x}", addr, r_offset, r_info);
+    //                 // println!("r_symtab_idx {:x}", r_symtab_idx);
+    //                 if let Ok(Some((symtab, sym_strtab))) = app_elf_file.dynamic_symbol_table() {
+    //                     if let Ok(symbol) = symtab.get(r_symtab_idx as usize) {
+    //                         // println!("{:?}", symbol);
+    //                         let fn_name = sym_strtab.get(symbol.st_name as usize);
+    //                         // println!("r_sym {:?}", fn_name);
+    //                         if let Ok(fn_name) = fn_name {
+    //                             fn_relocs.push(AppFuncReloc { fn_name: fn_name.to_string(), app_got_addr: r_offset })
+    //                         }
+    //                     };
+    //                 };
+    //             }
+    //             Ok(fn_relocs)
+    //         })
+    //     })
+    // } else {
+    //     Err(())
+    // }
+}
+
+/// Helper function to find a function symbol in a shared library ELF file.
+fn find_fn_in_shlib(verbose: bool, shlib_elf_file: &elf::ElfBytes::<elf::endian::AnyEndian>, fn_name: &String) -> Option<u32> {
+    if let Ok(Some((symtab, sym_strtab))) = shlib_elf_file.symbol_table() {
+        if let Some(fn_symbol) = symtab.iter().find(|sym| {
+            let name = sym_strtab
+                .get(sym.st_name as usize)
+                .expect("Failed to parse symbol name");
+            name == fn_name 
+        }) {
+            if verbose {
+                println!("Found fn {} at address 0x{:08X}", fn_name, fn_symbol.st_value);
+            }
+            return Some(fn_symbol.st_value as u32);
+        };
+    };
+    None
+}
+
+/// Output relocation information to a TOML formatted string.
+fn output_relocation_file (verbose: bool, shlib_deps: Option<Vec<PathBuf>>, app_relocs: Vec<AppFuncReloc>, package_name: &String, output_relocation: &mut String) -> io::Result<()> {
+    if verbose {
+        println!("APP RELOCS {:?}", app_relocs);
+        for reloc in &app_relocs {
+            println!("App needs relocation of function {} which has GOT address of 0x{:X}", reloc.fn_name, reloc.app_got_addr);
+        }
+    }
+    if let Some(shlib_deps) = &shlib_deps {
+        let mut shlib_fn_relocs: HashMap<String, ShLibFnReloc> = HashMap::new();
+
+        for shlib in shlib_deps {
+            if verbose {
+                println!("Found shared library dependency at: {}", shlib.display())
+            }
+            let mut shlib_file = fs::File::open(shlib).expect("Could not open the shared library elf file.");
+            let mut shlib_elf_file_buf = Vec::<u8>::default();
+            shlib_file.read_to_end(&mut shlib_elf_file_buf)?;
+            let shlib_elf_file = elf::ElfBytes::<elf::endian::AnyEndian>::minimal_parse(shlib_elf_file_buf.as_slice())
+                .expect("Could not parse the shared library elf file.");
+
+            let shlib_name = shlib.as_path().file_stem().expect("Could not get shared library filename").to_string_lossy().to_string();
+
+            // For each function we need to relocate, 
+            // find it in the shared libraries we were given
+            for reloc in &app_relocs {
+                // if we already found this function in another shared library, skip it
+                if shlib_fn_relocs.contains_key(&reloc.fn_name) {
+                    continue;
+                }
+
+                if verbose {
+                    println!("Searching for fn {} in shared library {}", &reloc.fn_name, shlib_name);
+                }
+
+                let fn_offset = find_fn_in_shlib(verbose, &shlib_elf_file, &reloc.fn_name);
+                if let Some(fn_offset) = fn_offset {
+                    let shlib_reloc = ShLibFnReloc { 
+                        lib_name: shlib_name.clone(), 
+                        lib_fn_offset: fn_offset 
+                    };
+                    shlib_fn_relocs.insert(reloc.fn_name.clone(), shlib_reloc);
+                }
+            }
+        }
+
+        // Create a relocation TOML file that will look something like this:
+        // [ml_func]
+        // app_got_addr = 0x000
+        // lib_name = "libtest.so"
+        // lib_func_offset = 0x00
+        //
+        // It will help tockloader update GOT entries needed for 
+        // function calls into shared libraries 
+        for reloc in &app_relocs {
+            if let Some(shlib_fn_reloc) = shlib_fn_relocs.get(&reloc.fn_name) {
+                writeln!(output_relocation, "[{}]", reloc.fn_name).unwrap();
+                writeln!(output_relocation, "app_name = \"{}\"", package_name).unwrap();
+                writeln!(output_relocation, "app_got_addr = 0x{:x}", reloc.app_got_addr).unwrap();
+                writeln!(output_relocation, "lib_name = \"{}\"", shlib_fn_reloc.lib_name).unwrap();
+                writeln!(output_relocation, "lib_func_offset = 0x{:x}", shlib_fn_reloc.lib_fn_offset).unwrap();
+            };
+        }
+
+        if verbose {
+            println!("Generating relocation TOML for function relocations:");
+            println!("{}", output_relocation);
+        }
+    }
+    Ok(())
+}
+
 /// Convert an ELF file to a TBF (Tock Binary Format) binary file.
 ///
 /// This will place all segments from the ELF file into a binary and prepend a
@@ -142,6 +473,8 @@ pub fn elf_to_tbf(
     sha384: bool,
     sha512: bool,
     rsa4096_private_key: Option<PathBuf>,
+    shlib_deps: Option<Vec<PathBuf>>,
+    output_relocation: &mut String,
 ) -> io::Result<()> {
     let package_name = package_name.unwrap_or_default();
 
@@ -159,6 +492,12 @@ pub fn elf_to_tbf(
         }
     };
 
+    let elf_type = elf_file.ehdr.e_type;
+
+    if verbose {
+        println!("Parsing ELF of type {} ({})", e_type_to_string(elf_type), e_type_to_human_str(elf_type).unwrap());
+    }
+
     let elf_sections: Vec<(String, elf::section::SectionHeader)> = shdr_tab
         .iter()
         .map(|shdr| {
@@ -171,6 +510,37 @@ pub fn elf_to_tbf(
             )
         })
         .collect();
+
+    let (is_shared_library, deps) = match elf_type {
+        elf::abi::ET_DYN => 
+            // is a shared library
+            (1, None),
+        _ => {
+            // is not a shared library, find which ones we depend on
+            (0, get_shared_library_deps(&elf_file, &elf_file_buf).ok())
+        }
+    };
+
+    if verbose {
+        let _ = deps.map(|deps| {
+            println!("Depends on shared libraries: {:?}", deps);
+        });
+    }
+
+    let mut shlib_dep_names: Vec<String> = Vec::new();
+    if let Some(shlib_deps) = &shlib_deps {
+        for shlib in shlib_deps {
+            if verbose {
+                println!("Found shared library dependency at: {}", shlib.display())
+            }
+            let mut shlib_file = fs::File::open(shlib).expect("Could not open the shared library elf file.");
+            let mut shlib_elf_file_buf = Vec::<u8>::default();
+            shlib_file.read_to_end(&mut shlib_elf_file_buf)?;
+
+            let shlib_name = shlib.as_path().file_stem().expect("Could not get shared library filename").to_string_lossy().to_string();
+            shlib_dep_names.push(shlib_name.clone());
+        }
+    }
 
     let mut elf_phdrs: Vec<elf::segment::ProgramHeader> = elf_file
         .segments()
@@ -455,13 +825,15 @@ pub fn elf_to_tbf(
     let header_length = tbfheader.create(
         minimum_ram_size,
         writeable_flash_regions_count,
-        package_name,
+        package_name.clone(),
         fixed_address_ram,
         fixed_address_flash,
         permissions,
         storage_ids,
         kernel_version,
         short_id,
+        Some(is_shared_library),
+        shlib_dep_names,
         disabled,
     );
 
@@ -562,6 +934,11 @@ pub fn elf_to_tbf(
             }
         };
 
+    if verbose {
+        println!("Protected region size: {} bytes", protected_region_size);
+        println!("Header length: {} bytes", header_length);
+    }
+
     // Validate that the protected region size at the very least fits our TBF
     // headers:
     if protected_region_size < header_length as u32 {
@@ -619,6 +996,9 @@ pub fn elf_to_tbf(
     // Keep track of the end address of the last segment (once we have a first
     // segment). This allows us to insert padding between segments as necessary.
     let mut last_segment_address_end: Option<usize> = None;
+
+    // Address of the .got section in the output TBF file
+    let mut got_address_in_tbf: Option<usize> = None;
 
     // Iterate over ELF's Program Headers to assemble the binary image as a
     // contiguous memory block. Only take into consideration segments where
@@ -754,6 +1134,14 @@ pub fn elf_to_tbf(
 
             // Check if this section is within the segment.
             if section_in_segment(shdr, segment) {
+                if sh_name == ".got" {
+                    got_address_in_tbf = Some(binary_index + (shdr.sh_offset - segment.p_offset) as usize);
+                    if verbose {
+                        println!("GOT located at 0x{:x} in original ELF file", shdr.sh_addr);
+                        println!("\t Located at 0x{:x} in TBF file", got_address_in_tbf.unwrap());
+                        println!("\t binary_index = 0x{:x}; shdr.sh_offset = 0x{:x}; segment.p_offset = 0x{:x};", binary_index, shdr.sh_offset, segment.p_offset);
+                    }
+                }
                 // This section is in this segment.
                 if verbose {
                     println!(
@@ -794,6 +1182,23 @@ pub fn elf_to_tbf(
                         );
                     }
                 }
+
+                if is_shared_library == 1 {
+                    let rel_data = elf_sections
+                        .iter()
+                        .find(|(sh_name, _)| *sh_name == ".rel.text")
+                        .map(|(_, shdr)| {
+                            elf_file.section_data_as_rels(shdr)
+                            // elf_file.section_data(shdr).map_or(&[], |(data, _)| data)
+                        });
+
+                    if let Some(Ok(rels)) = rel_data {
+                        for rel in rels.into_iter() {
+                            println!("r_type is {}", rel.r_type);
+                        };
+                    };
+                }
+
 
                 // Second, check if this is a writeable flash region and if so,
                 // include its details in the TBF header.
@@ -952,6 +1357,9 @@ pub fn elf_to_tbf(
     output.write_all(binary.as_ref())?;
 
     let rel_data_len: [u8; 4] = (relocation_binary.len() as u32).to_le_bytes();
+    if verbose {
+        println!("Relocation data length: {}", relocation_binary.len());
+    }
     output.write_all(&rel_data_len)?;
     output.write_all(relocation_binary.as_ref())?;
 
@@ -1109,7 +1517,6 @@ pub fn elf_to_tbf(
             format: header::TbfFooterCredentialsType::Rsa4096Key,
             data: credentials,
         };
-
         output.write_all(rsa4096_credentials.generate().unwrap().get_ref())?;
         footer_space_remaining -= rsa4096_len;
         if verbose {
@@ -1141,6 +1548,9 @@ pub fn elf_to_tbf(
 
     // Pad to get a power of 2 sized flash app, if requested.
     util::do_pad(output, post_content_pad)?;
+
+    let app_relocs = get_fn_relocs(verbose, &elf_sections, &elf_file, &elf_file_buf, got_address_in_tbf.unwrap()).unwrap_or_default();
+    output_relocation_file(verbose, shlib_deps, app_relocs, &package_name, output_relocation)?;
 
     Ok(())
 }
